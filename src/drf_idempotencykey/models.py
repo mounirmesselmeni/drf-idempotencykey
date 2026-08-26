@@ -88,12 +88,8 @@ class IdempotencyKey(models.Model):
                 return
 
         content_type = response.headers.get("Content-Type", "")
-        is_text_like = (
-            content_type and (
-                "json" in content_type
-                or "text" in content_type
-                or "application/xml" in content_type
-            )
+        is_text_like = content_type and (
+            "json" in content_type or "text" in content_type or "application/xml" in content_type
         )
         if content_type and not is_text_like:
             self.response_body = ""

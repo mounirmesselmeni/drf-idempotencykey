@@ -129,7 +129,6 @@ class DrfIdempotencyKeyMixin:
                 return self._get_cached_response(self._idempotency_instance)
         return None
 
-
     def _post_idempotent_response(self, response: HttpResponse) -> None:
         if self._idempotency_instance:
             self._handle_response(self.request, response)
