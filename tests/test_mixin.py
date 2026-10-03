@@ -6,7 +6,7 @@ from dateutil.relativedelta import relativedelta
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError
-from django.http import HttpRequest, HttpResponse
+from django.http import HttpRequest, HttpResponse, StreamingHttpResponse
 from django.test import override_settings
 from django.urls import path
 from django.utils import timezone
@@ -81,6 +81,55 @@ class TestIdempotencyKeyDrfMixin(APITestCase):
         self.assertEqual(repeat.status_code, 200)
         self.assertTrue(repeat.has_header("Cached-From-Idempotency-Key"))
         self.assertEqual(repeat["Cached-From-Idempotency-Key"], idempotency_key)
+
+    def test_query_string_is_part_of_request_fingerprint(self):
+        key = str(uuid.uuid4())
+        first = self.client.post(
+            "/test-api/?account=one",
+            {"data": "test"},
+            headers={"Idempotency-Key": key},
+            content_type="application/json",
+        )
+        second = self.client.post(
+            "/test-api/?account=two",
+            {"data": "test"},
+            headers={"Idempotency-Key": key},
+            content_type="application/json",
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 409)
+
+    def test_cached_response_preserves_headers_and_cookies(self):
+        class HeaderResponseAPIView(TestAPIView):
+            def post(self, request):
+                response = Response({"created": True})
+                response["Location"] = "/resources/123/"
+                response["ETag"] = '"resource-v1"'
+                response.set_cookie("session_hint", "created", httponly=True, samesite="Lax")
+                return response
+
+        with override_settings(ROOT_URLCONF=__name__):
+            urlpatterns.append(path("header-api/", HeaderResponseAPIView.as_view(), name="header-api"))
+            key = str(uuid.uuid4())
+            first = self.client.post(
+                "/header-api/",
+                {"data": "test"},
+                headers={"Idempotency-Key": key},
+                content_type="application/json",
+            )
+            repeated = self.client.post(
+                "/header-api/",
+                {"data": "test"},
+                headers={"Idempotency-Key": key},
+                content_type="application/json",
+            )
+
+        self.assertEqual(repeated.status_code, first.status_code)
+        self.assertEqual(repeated["Location"], first["Location"])
+        self.assertEqual(repeated["ETag"], first["ETag"])
+        self.assertEqual(repeated.cookies["session_hint"].value, "created")
+        self.assertTrue(repeated.cookies["session_hint"]["httponly"])
 
     @add_idempotency_test
     def test_post_repeated_request_returns_cached_response(self):
@@ -178,6 +227,15 @@ class TestIdempotencyKeyDrfMixin(APITestCase):
             )
             self.assertEqual(response.status_code, 400)
             self.assertEqual(response.json()["errors"][0]["error_code"], "MISSING_IDEMPOTENCY_KEY")
+
+    @override_settings(IDEMPOTENCY_KEY_REQUIRED=True, IDEMPOTENCY_KEY_EXEMPT_PATH_RE=r"^/exempt/")
+    def test_exempt_path_does_not_require_idempotency_header(self):
+        with override_settings(ROOT_URLCONF=__name__):
+            urlpatterns.append(path("exempt/", TestAPIView.as_view(), name="exempt"))
+            response = self.client.post("/exempt/", {"data": "test"}, content_type="application/json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(IdempotencyKey.objects.count(), 0)
 
     def test_redact_body_hook_is_used_for_persistence(self):
         class RedactedAPIView(TestAPIView):
@@ -352,45 +410,56 @@ class TestIdempotencyKeyDrfMixin(APITestCase):
         with time_machine.travel(timezone.now() + relativedelta(minutes=61), tick=True):
             retry = self.client.post(
                 "/test-api/",
-                {"data": "test"},
+                {"data": "changed"},
+                headers={"Idempotency-Key": key},
+                content_type="application/json",
+            )
+            repeated = self.client.post(
+                "/test-api/",
+                {"data": "changed"},
                 headers={"Idempotency-Key": key},
                 content_type="application/json",
             )
 
         self.assertEqual(retry.status_code, 200)
+        self.assertEqual(repeated.status_code, 200)
+        self.assertTrue(repeated.has_header("Cached-From-Idempotency-Key"))
         self.assertEqual(IdempotencyKey.objects.count(), 1)
+        record = IdempotencyKey.objects.get(key=key)
+        self.assertIn("changed", record.request_body)
+        self.assertFalse(record.is_expired())
 
-    def test_concurrent_first_create_is_guarded(self):
+    def test_concurrent_first_create_race_uses_existing_record(self):
         key = str(uuid.uuid4())
+        body = b'{"data":"test"}'
+        digest = DrfIdempotencyKeyMixin._make_digest("POST", body, "/race/")
 
         first = IdempotencyKey.objects.create(
             key=key,
             user=self.user,
             request_method="POST",
-            request_body="payload",
+            request_body=body.decode(),
             request_path="/race/",
-            request_digest=b"abc123",
+            request_digest=digest,
             last_accessed_at=timezone.now(),
+            response_code=200,
+            response_body="{}",
+            response_content_type="application/json",
         )
+        request = HttpRequest()
+        request.method = "POST"
+        request.path = "/race/"
+        request.path_info = "/race/"
+        request.user = self.user
+        request._read_started = True
+        request._body = body
 
-        with (
-            mock.patch.object(IdempotencyKey.objects, "get_or_create", side_effect=IntegrityError("duplicate key")),
-            self.assertRaises(IntegrityError),
-        ):
-            IdempotencyKey.objects.get_or_create(
-                key=key,
-                user=self.user,
-                defaults={
-                    "request_method": "POST",
-                    "request_body": "payload",
-                    "request_path": "/race/",
-                    "request_digest": b"abc123",
-                    "last_accessed_at": timezone.now(),
-                },
-            )
+        with mock.patch.object(IdempotencyKey.objects, "get_or_create", side_effect=IntegrityError("duplicate key")):
+            obj, created, expired = TestAPIView()._get_or_create_key(request, key, digest)
 
-        self.assertEqual(IdempotencyKey.objects.filter(key=key).count(), 1)
-        self.assertEqual(IdempotencyKey.objects.get(key=key, user=self.user).pk, first.pk)
+        self.assertFalse(created)
+        self.assertFalse(expired)
+        self.assertEqual(obj.pk, first.pk)
 
     @override_settings(IDEMPOTENCY_KEY_MAX_BODY_SIZE=10)
     def test_large_response_body_is_not_stored(self):
@@ -421,6 +490,24 @@ class TestIdempotencyKeyDrfMixin(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(IdempotencyKey.objects.count(), 1)
         self.assertEqual(IdempotencyKey.objects.get().response_body, "")
+
+    def test_streaming_response_is_not_cached_as_an_empty_replay(self):
+        class StreamingAPIView(TestAPIView):
+            def post(self, request):
+                return StreamingHttpResponse(iter([b"streamed"]), content_type="text/plain")
+
+        with override_settings(ROOT_URLCONF=__name__):
+            urlpatterns.append(path("streaming-api/", StreamingAPIView.as_view(), name="streaming-api"))
+            response = self.client.post(
+                "/streaming-api/",
+                {"data": "test"},
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(b"".join(response.streaming_content), b"streamed")
+        self.assertEqual(IdempotencyKey.objects.count(), 0)
 
     def test_response_without_content_type_raises_value_error(self):
         key = str(uuid.uuid4())

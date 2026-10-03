@@ -43,6 +43,8 @@ class IdempotencyKey(models.Model):
     response_code = models.PositiveSmallIntegerField(null=True, blank=True)
     response_body = models.TextField(blank=True)
     response_content_type = models.CharField(max_length=255, blank=True)
+    response_headers = models.JSONField(default=dict, blank=True)
+    response_cookies = models.JSONField(default=dict, blank=True)
     response_saved_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -71,6 +73,24 @@ class IdempotencyKey(models.Model):
         if hasattr(response, "is_rendered") and not response.is_rendered:
             response.render()
 
+        excluded_headers = {
+            "connection",
+            "content-length",
+            "content-type",
+            "date",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        }
+        self.response_headers = {
+            name: value for name, value in response.headers.items() if name.lower() not in excluded_headers
+        }
+        self.response_cookies = {name: morsel.OutputString() for name, morsel in response.cookies.items()}
+
         if max_body_size is not None:
             max_body_size = int(max_body_size)
             if len(response.content or b"") > max_body_size:
@@ -82,6 +102,8 @@ class IdempotencyKey(models.Model):
                         "response_code",
                         "response_body",
                         "response_content_type",
+                        "response_headers",
+                        "response_cookies",
                         "response_saved_at",
                     ]
                 )
@@ -95,7 +117,16 @@ class IdempotencyKey(models.Model):
             self.response_body = ""
             self.response_content_type = content_type
             self.response_saved_at = timezone.now()
-            self.save(update_fields=["response_code", "response_body", "response_content_type", "response_saved_at"])
+            self.save(
+                update_fields=[
+                    "response_code",
+                    "response_body",
+                    "response_content_type",
+                    "response_headers",
+                    "response_cookies",
+                    "response_saved_at",
+                ]
+            )
             return
 
         try:
@@ -108,7 +139,16 @@ class IdempotencyKey(models.Model):
         elif self.response_body:
             raise ValueError("Response body is not empty but Content-Type is missing.")
         self.response_saved_at = timezone.now()
-        self.save(update_fields=["response_code", "response_body", "response_content_type", "response_saved_at"])
+        self.save(
+            update_fields=[
+                "response_code",
+                "response_body",
+                "response_content_type",
+                "response_headers",
+                "response_cookies",
+                "response_saved_at",
+            ]
+        )
 
     def is_expired(self) -> bool:
         expiration_minutes = getattr(settings, "IDEMPOTENCY_KEY_EXPIRATION_MINUTES", 60)

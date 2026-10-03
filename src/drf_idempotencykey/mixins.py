@@ -139,11 +139,25 @@ class DrfIdempotencyKeyMixin:
             content=idempotency_instance.response_body,
             content_type=idempotency_instance.response_content_type,
         )
+        for name, value in idempotency_instance.response_headers.items():
+            response[name] = value
+        for cookie in idempotency_instance.response_cookies.values():
+            response.cookies.load(cookie)
         response[IDEMPOTENCY_CACHE_HEADER] = idempotency_instance.key
         return response
 
     def _handle_response(self, request: HttpRequest, response: HttpResponse) -> None:
         if not self._idempotency_instance:
+            return
+
+        if getattr(response, "streaming", False):
+            logging.warning(
+                "Skipping idempotency response storage for streaming response from %s %s.",
+                request.method,
+                request.path_info,
+            )
+            self._idempotency_instance.delete()
+            self._idempotency_instance = None
             return
 
         if hasattr(response, "is_rendered") and not response.is_rendered:
@@ -205,7 +219,7 @@ class DrfIdempotencyKeyMixin:
         idempotency_key = request.headers[header_name]
         self._validate_uuid(idempotency_key)
 
-        digest = self._make_digest(request.method, request.body, request.path_info)
+        digest = self._make_digest(request.method, request.body, request.get_full_path())
         return self._get_or_create_key(request, idempotency_key, digest)
 
     @classmethod
@@ -236,6 +250,9 @@ class DrfIdempotencyKeyMixin:
         exempt_pattern = getattr(settings, "IDEMPOTENCY_KEY_EXEMPT_PATH_RE", "")
         compiled_pattern = _get_compiled_exempt_pattern(exempt_pattern)
         exempt_match = bool(compiled_pattern and compiled_pattern.match(request.path_info))
+        if exempt_match:
+            return True
+
         require_header = getattr(self, "require_idempotency_key", False) or getattr(
             settings,
             "IDEMPOTENCY_KEY_REQUIRED",
@@ -261,7 +278,7 @@ class DrfIdempotencyKeyMixin:
             )
             return True
 
-        return exempt_match or not is_authenticated()
+        return not is_authenticated()
 
     def _validate_uuid(self, idempotency_key: str):
         try:
@@ -272,6 +289,7 @@ class DrfIdempotencyKeyMixin:
     def _get_or_create_key(
         self, request: HttpRequest, idempotency_key: str, digest: bytes
     ) -> tuple[IdempotencyKey, bool, bool]:
+        request_path = request.get_full_path()
         request_body = self.redact_body(request.body.decode("utf-8", errors="replace"))
         try:
             obj, created = IdempotencyKey.objects.get_or_create(
@@ -280,7 +298,7 @@ class DrfIdempotencyKeyMixin:
                 defaults={
                     "request_method": request.method,
                     "request_body": request_body,
-                    "request_path": request.path_info,
+                    "request_path": request_path,
                     "request_digest": digest,
                     "last_accessed_at": timezone.now(),
                 },
@@ -291,26 +309,32 @@ class DrfIdempotencyKeyMixin:
 
         is_expired = False
         if not created:
-            obj = self._lock_and_validate_key(idempotency_key, request.user, digest)
-            is_expired = self._check_expiration(obj)
+            obj, is_expired = self._lock_and_validate_key(idempotency_key, request.user, digest)
             if is_expired:
                 self._reset_for_retry(obj, request, digest)
+            else:
+                self._check_expiration(obj)
             obj.set_accessed()
 
         return obj, created, is_expired
 
     def _reset_for_retry(self, obj: IdempotencyKey, request: HttpRequest, digest: bytes) -> None:
+        now = timezone.now()
         obj.request_method = request.method
         obj.request_body = self.redact_body(request.body.decode("utf-8", errors="replace"))
-        obj.request_path = request.path_info
+        obj.request_path = request.get_full_path()
         obj.request_digest = digest
         obj.response_code = None
         obj.response_body = ""
         obj.response_content_type = ""
+        obj.response_headers = {}
+        obj.response_cookies = {}
         obj.response_saved_at = None
-        obj.last_accessed_at = timezone.now()
+        obj.created_at = now
+        obj.last_accessed_at = now
         obj.save(
             update_fields=[
+                "created_at",
                 "request_method",
                 "request_body",
                 "request_path",
@@ -318,20 +342,27 @@ class DrfIdempotencyKeyMixin:
                 "response_code",
                 "response_body",
                 "response_content_type",
+                "response_headers",
+                "response_cookies",
                 "response_saved_at",
                 "last_accessed_at",
+                "modified_at",
             ]
         )
 
-    def _lock_and_validate_key(self, idempotency_key: str, user: Any, digest: bytes):
+    def _lock_and_validate_key(self, idempotency_key: str, user: Any, digest: bytes) -> tuple[IdempotencyKey, bool]:
         obj = IdempotencyKey.objects.select_for_update().get(key=idempotency_key, user=user)
+        is_expired = obj.is_expired()
+        if is_expired:
+            return obj, True
+
         obj_digest = obj.request_digest.tobytes() if not isinstance(obj.request_digest, bytes) else obj.request_digest
         if obj_digest != digest:
             raise Http409Error(
                 "Request parameters do not match the original request.",
                 code="IDEMPOTENCY_KEY_IN_USE_WITH_DIFFERENT_REQUEST",
             )
-        return obj
+        return obj, False
 
     def _check_expiration(self, obj: IdempotencyKey) -> bool:
         is_expired = obj.is_expired()
