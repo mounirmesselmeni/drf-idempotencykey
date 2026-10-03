@@ -1,6 +1,6 @@
 [project]
 name = "drf-idempotencykey"
-version = "0.1.0"
+version = "0.2.0"
 
 description = "Reusable idempotency-key support for Django REST Framework APIs"
 readme = "README.md"
@@ -60,6 +60,7 @@ include = [
     "src/drf_idempotencykey",
     "tests",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "prek.toml",
 ]
