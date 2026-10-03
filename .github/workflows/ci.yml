@@ -39,19 +39,12 @@ jobs:
       - name: Install Django matrix version
         run: uv pip install "Django~=${{ matrix.django-version }}.0"
 
-      - name: Cache pre-commit hooks
+      - name: Run prek
         if: matrix.python-version == '3.14' && matrix.django-version == '6.1'
-        id: pre-commit-cache
-        uses: actions/cache@v4
+        uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # v3.0.0
         with:
-          path: $HOME/.cache/pre-commit
-          key: ${{ runner.os }}-${{ matrix.python-version }}-pre-commit-hooks-${{ hashFiles('**/.pre-commit-config.yaml') }}
-
-      - name: Run pre-commit
-        if: matrix.python-version == '3.14' && matrix.django-version == '6.1'
-        run: uv run pre-commit run --all-files
-        env:
-          PRE_COMMIT_HOME: $HOME/.cache/pre-commit
+          prek-version: "0.5.4"
+          extra-args: --all-files
 
       - name: Run lint
         if: matrix.python-version == '3.14' && matrix.django-version == '6.1'

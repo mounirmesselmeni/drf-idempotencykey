@@ -2,7 +2,7 @@
 
 Idempotent API requests for Django REST Framework, built for real-world services that need safe retry behavior without duplicate writes.
 
-This package stores a request fingerprint per user and idempotency key, reuses the original response for repeat requests, and rejects mismatched payloads or method changes with clear HTTP 400/409 responses.
+This package stores a request fingerprint per user and idempotency key, reuses the original response body, status, and replayable headers for repeat requests, and rejects mismatched requests with clear HTTP 400/409 responses.
 
 ## Why this package? 🚀
 
@@ -10,7 +10,7 @@ When the same client retries a POST, PUT, or PATCH request due to a timeout or m
 
 - the authenticated user
 - the HTTP method
-- the request path
+- the full request path, including the query string
 - the request body hash
 - the original response payload
 
@@ -109,9 +109,10 @@ sequenceDiagram
 A few important details:
 
 - The request fingerprint is tied to the authenticated user, so the same idempotency key is not shared across users.
+- The request fingerprint includes the full path and query string, so changing query parameters with the same key is a conflict.
 - The record is protected with a `select_for_update()` lock when checking or saving the response, so concurrent duplicates are serialized.
 - If a request is still in progress, the second caller gets a 409 with `Retry-After`; if the key is reused with different request parameters, it also gets a 409.
-- Once a successful response is saved, later retries with the same request payload return the original cached body.
+- Once a successful response is saved, later retries with the same request return the original cached body, status, end-to-end response headers, and cookies. Hop-by-hop and representation headers are regenerated or omitted.
 
 ## Configuration 🛠️
 
@@ -133,7 +134,7 @@ These are the settings currently supported by the package:
 - `IDEMPOTENCY_KEY_HEADER`: HTTP header name to read for the idempotency key. Default: `"Idempotency-Key"`.
 - `IDEMPOTENCY_KEY_METHODS`: iterable of HTTP methods that participate in idempotency enforcement. Default: `("POST", "PUT", "PATCH")`.
 - `IDEMPOTENCY_KEY_REQUIRED`: if `True`, requests on configured methods without the idempotency header are rejected with a 400 before the view runs. Default: `False`.
-- `IDEMPOTENCY_KEY_MAX_BODY_SIZE`: maximum stored payload size in bytes before the library skips persisting request/response bodies and logs a warning. Default: unset/disabled.
+- `IDEMPOTENCY_KEY_MAX_BODY_SIZE`: maximum request or response body size in bytes. An oversized request bypasses idempotency enforcement; an oversized response is returned but its idempotency record is deleted, so retries can execute the view again. Both cases log a warning. Default: unset/disabled.
 - `IDEMPOTENCY_KEY_RETRY_AFTER_SECONDS`: `Retry-After` value attached to the in-progress 409 response when a duplicate request is already being processed. Default: `5`.
 - `IDEMPOTENCY_KEY_CLEANUP_INTERVAL_HOURS`: legacy scheduling hint for external cron/beat jobs. The package has a shared `.expired()` queryset and does not currently use this value in the runtime cleanup logic itself; schedule the job outside the app as needed. Default: `24`.
 
@@ -171,11 +172,11 @@ For tests where you want the repeated-request check to be automatic, use the dec
 from drf_idempotencykey.testing import add_idempotency_test
 
 
-class CheckoutSessionTests(APITestCase):
+class OrderCancellationTests(APITestCase):
     @add_idempotency_test
-    def test_cancel_checkout_session(self):
-        checkout_session = CheckoutSessionFactory(shop=self.shop)
-        response = self.cancel_checkout_session(checkout_session.api_id, {"cancellation_reason": "duplicate"})
+    def test_cancel_order(self):
+        order = OrderFactory(shop=self.shop)
+        response = self.cancel_order(order.api_id, {"cancellation_reason": "duplicate"})
         self.assertEqual(response.status_code, 204)
 ```
 
@@ -234,7 +235,7 @@ If the same idempotency key is reused with a different payload or method, the AP
 
 This package intentionally stores a small amount of request metadata for replay safety, but it does not guarantee that raw request or response bodies are safe to persist in production. Full payloads may include passwords, API tokens, card numbers, PII, or other sensitive values.
 
-To avoid storing raw sensitive material, override the mixin hook on your view class:
+To avoid storing raw sensitive request material, override the mixin hook on your view class:
 
 ```python
 from drf_idempotencykey.mixins import DrfIdempotencyKeyMixin
@@ -247,13 +248,13 @@ class CreateInvoiceView(DrfIdempotencyKeyMixin):
         return "[REDACTED]"
 ```
 
-The default implementation is a no-op, so if you do not override it the original body text will be stored verbatim. This is convenient for development but should not be considered production-safe by default for sensitive endpoints.
+The default implementation is a no-op, so if you do not override it the original request body text will be stored verbatim. This hook applies only to request bodies. Response bodies, replayable response headers, and cookies are also stored verbatim because they are needed for replay; avoid caching responses containing secrets or sensitive data, or provide a custom storage/redaction policy with the understanding that redacted cached responses will differ from the original response. This is convenient for development but should not be considered production-safe by default for sensitive endpoints.
 
 In addition, the project removes `request_body` from the default Django admin search fields so it is not exposed through the admin UI by default, but you should still treat the field as sensitive data and plan for a retention policy or redaction layer.
 
 ## Binary / non-UTF-8 payloads 📦
 
-This package stores the request fingerprint and response body metadata for replayed idempotent requests. The request body is stored as a UTF-8 text representation with replacement characters for invalid bytes, and the response body is cached as text when the response is text-like (`application/json`, `text/*`, or XML). For binary payloads or other content types that cannot be represented safely as UTF-8 text, the package skips persisting the raw response body and keeps the idempotency record only for the request metadata and status code.
+This package stores the request fingerprint and response body metadata for replayed idempotent requests. The request body is stored as a UTF-8 text representation with replacement characters for invalid bytes, and the response body is cached as text when the response is text-like (`application/json`, `text/*`, or XML). For binary payloads or other content types that cannot be represented safely as UTF-8 text, the package skips persisting the raw response body and keeps the idempotency record only for the request metadata and status code. Streaming responses are not cached: their idempotency record is removed after the response is produced, so a retry can run the view again.
 
 This is a deliberate safety tradeoff: it avoids crashing on binary downloads or other non-text responses, but it means binary or opaque response payloads are not replayed byte-for-byte. If your API serves file downloads or binary payloads, treat these endpoints as unsupported for strict response-body replay semantics.
 
@@ -311,8 +312,10 @@ Install the dev environment with uv:
 
 ```bash
 uv sync --group dev
+uv run prek run --all-files
 uv run ruff check .
-uv run python -m django test tests.test_mixin --settings=tests.settings
+uv run coverage run --source=drf_idempotencykey -m django test --settings=tests.settings
+uv run coverage report
 ```
 
 ## License 📄

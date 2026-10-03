@@ -1,6 +1,6 @@
 [project]
 name = "drf-idempotencykey"
-version = "0.1.0"
+version = "0.2.0"
 
 description = "Reusable idempotency-key support for Django REST Framework APIs"
 readme = "README.md"
@@ -42,7 +42,7 @@ Issues = "https://github.com/mounirmesselmeni/drf-idempotencykey/issues"
 dev = [
     "coverage>=7,<8",
     "factory-boy>=3.2,<4",
-    "pre-commit>=3,<5",
+    "prek>=0.5.4,<1",
     "ruff>=0.6,<0.17",
     "time-machine>=2.15,<3",
 ]
@@ -60,8 +60,9 @@ include = [
     "src/drf_idempotencykey",
     "tests",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
-    ".pre-commit-config.yaml",
+    "prek.toml",
 ]
 exclude = ["tests/.coverage"]
 
@@ -69,7 +70,7 @@ exclude = ["tests/.coverage"]
 exclude = [
     ".git",
     ".mypy_cache",
-    ".pre-commit-cache",
+    ".prek-cache",
     ".ruff_cache",
     ".tox",
     ".cache",
